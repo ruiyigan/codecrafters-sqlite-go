@@ -5,11 +5,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"strconv"
+	"strings"
 	// Available if you need it!
 	// "github.com/xwb1989/sqlparser"
 )
 
+// HELPERS
 func readBytesAtOffset(file *os.File, offset int64, numBytes int) ([]byte, error) {
 	_, err := file.Seek(offset, 0)
 	if err != nil {
@@ -89,13 +93,134 @@ func getSerialTypeSize(serialType int64) int {
 	return 0
 }
 
+func processSerialType(serialType int64, value []byte) string {
+	var strValue string
+
+	switch serialType {
+	case 0: // NULL
+		strValue = "NULL"
+	case 1: // 8-bit twos-complement integer
+		strValue = fmt.Sprintf("%d", int8(value[0]))
+	case 2: // 16-bit twos-complement integer (big-endian)
+		num := int16(binary.BigEndian.Uint16(value))
+		strValue = fmt.Sprintf("%d", num)
+	case 3: // 24-bit twos-complement integer (big-endian)
+		num := int32(binary.BigEndian.Uint32(append([]byte{0}, value[:3]...))) >> 8 // Pad to 32-bit and shift
+		strValue = fmt.Sprintf("%d", num)
+	case 4: // 32-bit twos-complement integer (big-endian)
+		num := int32(binary.BigEndian.Uint32(value))
+		strValue = fmt.Sprintf("%d", num)
+	case 5: // 48-bit twos-complement integer (big-endian)
+		num := int64(binary.BigEndian.Uint64(append([]byte{0, 0}, value[:6]...))) >> 16 // Pad to 64-bit and shift
+		strValue = fmt.Sprintf("%d", num)
+	case 6: // 64-bit twos-complement integer (big-endian)
+		num := int64(binary.BigEndian.Uint64(value))
+		strValue = fmt.Sprintf("%d", num)
+	case 7: // 64-bit IEEE 754-2008 floating point (big-endian)
+		bits := binary.BigEndian.Uint64(value)
+		num := math.Float64frombits(bits)
+		strValue = fmt.Sprintf("%f", num)
+	case 8: // Integer 0
+		strValue = "0"
+	case 9: // Integer 1
+		strValue = "1"
+	case 10, 11: // Reserved for internal use
+		strValue = fmt.Sprintf("Reserved(%d)", serialType)
+	default:
+		if serialType >= 12 && serialType%2 == 0 { // BLOB (N-12)/2 bytes
+			blobLen := (serialType - 12) / 2
+			if int64(len(value)) >= blobLen {
+				strValue = fmt.Sprintf("BLOB(%d bytes)", blobLen)
+				// Optionally: strValue = hex.EncodeToString(value[:blobLen]) for hex representation
+			} else {
+				strValue = "Invalid BLOB"
+			}
+		} else if serialType >= 13 && serialType%2 == 1 { // String (N-13)/2 bytes
+			strLen := (serialType - 13) / 2
+			if int64(len(value)) >= strLen {
+				strValue = string(value[:strLen]) // No null terminator
+			} else {
+				strValue = "Invalid String"
+			}
+		} else {
+			strValue = "Unknown Type"
+		}
+	}
+
+	return strValue
+}
+
+func getCellCount(databaseFile *os.File, pageOffset int32) uint16 {
+	data, err := readBytesAtOffset(databaseFile, int64(pageOffset+3), 2)
+	if err != nil {
+		return 0
+	}
+	cellCount := binary.BigEndian.Uint16(data)
+	return cellCount
+}
+
+func getRightmostChildPageNumber(databaseFile *os.File, pageOffset int32) int32 {
+	data, err := readBytesAtOffset(databaseFile, int64(pageOffset+8), 4)
+	if err != nil {
+		return 0
+	}
+	return int32(binary.BigEndian.Uint32(data))
+}
+
+func getCellContentOffset(databaseFile *os.File, cellPointerOffset int32) int32 {
+	data, err := readBytesAtOffset(databaseFile, int64(cellPointerOffset), 2)
+	if err != nil {
+		return 0
+	}
+	return int32(binary.BigEndian.Uint16(data)) // offset in the cell array is relative to 0
+}
+
+func processLeafCellRecord(databaseFile *os.File, cellContentOffset int32) ([]byte, []int64, int64) {
+	// [varint] read size of the record
+	data, err := readBytesAtOffset(databaseFile, int64(cellContentOffset), 9)
+	if err != nil {
+		return nil, nil, 0
+	}
+	recordSize, bytesReadRecordSize := readVarint(data, 0)
+
+	// [varint] read size of rowid
+	data, err = readBytesAtOffset(databaseFile, int64(cellContentOffset+bytesReadRecordSize), 9)
+	if err != nil {
+		return nil, nil, 0
+	}
+	_, bytesReadRowId := readVarint(data, 0)
+
+	// Read the record data (with header)
+	recordOffset := cellContentOffset + bytesReadRecordSize + bytesReadRowId
+	data, err = readBytesAtOffset(databaseFile, int64(recordOffset), int(recordSize))
+	if err != nil {
+		return nil, nil, 0
+	}
+
+	// [varint] Parse record header
+	headerSize, bytesReadHeader := readVarint(data, 0)
+	headerOffset := bytesReadHeader
+	bodyOffset := int64(headerSize) // Body starts after the header
+	bytesLeft := int32(headerSize) - bytesReadHeader
+
+	// Parse serial types
+	var serialTypes []int64
+	for int32(headerOffset) < bytesLeft {
+		serialType, bytesRead := readVarint(data, int(headerOffset))
+		headerOffset += bytesRead
+		serialTypes = append(serialTypes, serialType)
+	}
+
+	return data, serialTypes, bodyOffset
+}
+
+// PROCESS
 func getTablesNamesInBTree(databaseFile *os.File, pageNumber int32, pageSize int32) []string {
 	var tables []string
-	var pageOffset int32
+	const headerSize int32 = 100
+	var pageOffset int32 = (pageNumber - 1) * pageSize
 	if pageNumber == 1 {
-		pageOffset = (pageNumber-1)*pageSize + 100
-	} else {
-		pageOffset = (pageNumber - 1) * pageSize
+		pageOffset += headerSize
 	}
 
 	data, err := readBytesAtOffset(databaseFile, int64(pageOffset), 1)
@@ -105,57 +230,21 @@ func getTablesNamesInBTree(databaseFile *os.File, pageNumber int32, pageSize int
 
 	switch data[0] {
 	case 0x0D: // Leaf page
-		data, err = readBytesAtOffset(databaseFile, int64(pageOffset+3), 2)
-		if err != nil {
-			return tables
-		}
-		cellCount := binary.BigEndian.Uint16(data)
+		cellCount := getCellCount(databaseFile, pageOffset)
 		// Task 2: Read table names
 
 		// loop through cell count
 		for i := int32(0); i < int32(cellCount); i++ {
 			cellPointerOffset := pageOffset + 8 + (i * 2)
-			data, err = readBytesAtOffset(databaseFile, int64(cellPointerOffset), 2)
-			if err != nil {
-				continue
-			}
-			cellContentOffset := int32(binary.BigEndian.Uint16(data)) // offset in the cell array is relative to 0
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset)
 
-			// [varint] read size of the record
-			data, _ = readBytesAtOffset(databaseFile, int64(cellContentOffset), 9) // read the size of the record
-			recordSize, bytesReadRecordSize := readVarint(data, 0)
-
-			// [varint] read size of rowid
-			data, _ = readBytesAtOffset(databaseFile, int64(cellContentOffset+bytesReadRecordSize), 9)
-			_, bytesReadRowId := readVarint(data, 0)
-
-			// data here is the record data (with header) in bytes array
-			data, _ = readBytesAtOffset(databaseFile, int64(cellContentOffset+bytesReadRecordSize+bytesReadRowId), int(recordSize))
-
-			// [varint] read record header (use the first varint to determine how many times to read, ie how many values)
-			headerSize, bytesReadHeader := readVarint(data, 0)
-			headerOffset := bytesReadHeader
-			bodyOffset := int64(headerSize) // Body starts after the header
-			bytesLeft := int32(headerSize) - bytesReadHeader
-
-			var serialTypes []int64
-			for int32(headerOffset) < bytesLeft {
-				serialType, bytesRead := readVarint(data, int(headerOffset))
-				headerOffset += bytesRead
-				serialTypes = append(serialTypes, serialType)
-			}
+			data, serialTypes, bodyOffset := processLeafCellRecord(databaseFile, cellContentOffset)
 
 			for colIdx, serialType := range serialTypes {
 				size := getSerialTypeSize(serialType)
 				value := data[bodyOffset : bodyOffset+int64(size)]
 
-				var strValue string
-				if serialType >= 13 && serialType%2 == 1 { // String
-					strValue = string(value) // No null terminator in SQLite strings
-				} else if serialType == 1 { // 8-bit integer
-					strValue = fmt.Sprintf("%d", value[0])
-				} // Add other types as needed (e.g., 4 for 32-bit int, etc.)
-
+				strValue := processSerialType(serialType, value)
 				if colIdx == 2 { // tbl_name column
 					if serialType >= 13 && serialType%2 == 1 {
 						tables = append(tables, strValue)
@@ -171,19 +260,11 @@ func getTablesNamesInBTree(databaseFile *os.File, pageNumber int32, pageSize int
 		return tables
 
 	case 0x05: // Interior page
-		data, err = readBytesAtOffset(databaseFile, int64(pageOffset+3), 2)
-		if err != nil {
-			return tables
-		}
-		cellCount := binary.BigEndian.Uint16(data)
+		cellCount := getCellCount(databaseFile, pageOffset)
 
 		for i := int32(0); i < int32(cellCount); i++ {
 			cellPointerOffset := pageOffset + 12 + (i * 2)
-			data, err = readBytesAtOffset(databaseFile, int64(cellPointerOffset), 2)
-			if err != nil {
-				continue
-			}
-			cellContentOffset := int32(binary.BigEndian.Uint16(data))
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset)
 
 			data, err = readBytesAtOffset(databaseFile, int64(cellContentOffset), 4)
 			if err != nil {
@@ -196,11 +277,7 @@ func getTablesNamesInBTree(databaseFile *os.File, pageNumber int32, pageSize int
 		}
 
 		// Rightmost pointer
-		data, err = readBytesAtOffset(databaseFile, int64(pageOffset+8), 4)
-		if err != nil {
-			return tables
-		}
-		rightChildPageNumber := int32(binary.BigEndian.Uint32(data))
+		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
 		tempNames := getTablesNamesInBTree(databaseFile, rightChildPageNumber, pageSize)
 		tables = append(tables, tempNames...)
 	}
@@ -208,10 +285,89 @@ func getTablesNamesInBTree(databaseFile *os.File, pageNumber int32, pageSize int
 	return tables
 }
 
-func getNumTablesInBTree(databaseFile *os.File, pageNumber int32, pageSize int32) int {
+func getCountInATable(databaseFile *os.File, pageNumber int32, pageSize int32, tableName string) int {
+	const headerSize int32 = 100
+	var pageOffset int32 = (pageNumber - 1) * pageSize
+	if pageNumber == 1 {
+		pageOffset += headerSize
+	}
+
+	data, err := readBytesAtOffset(databaseFile, int64(pageOffset), 1)
+	if err != nil {
+		return 0
+	}
+
+	switch data[0] {
+	case 0x0D: // Leaf page
+		cellCount := getCellCount(databaseFile, pageOffset)
+		// Task 2: Read table names
+
+		// loop through cell count
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 8 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset) // offset in the cell array is relative to 0
+
+			data, serialTypes, bodyOffset := processLeafCellRecord(databaseFile, cellContentOffset)
+
+			var foundTable bool = false
+			for colIdx, serialType := range serialTypes {
+				size := getSerialTypeSize(serialType)
+				value := data[bodyOffset : bodyOffset+int64(size)]
+
+				strValue := processSerialType(serialType, value)
+
+				if colIdx == 2 { // tbl_name column
+					if serialType >= 13 && serialType%2 == 1 {
+						if strValue == tableName {
+							foundTable = true
+						}
+					}
+				}
+				if colIdx == 3 && foundTable {
+					// get root page
+					num, _ := strconv.Atoi(strValue)
+					count := countRecordsInBTree(databaseFile, int32(num), pageSize)
+					return count
+				}
+
+				bodyOffset += int64(size)
+			}
+
+		}
+
+		return 0
+
+	case 0x05: // Interior page
+		cellCount := getCellCount(databaseFile, pageOffset)
+
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 12 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset)
+
+			data, err = readBytesAtOffset(databaseFile, int64(cellContentOffset), 4)
+			if err != nil {
+				continue
+			}
+			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
+			return getCountInATable(databaseFile, leftChildPageNumber, pageSize, tableName)
+
+		}
+
+		// Rightmost pointer
+		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
+		return getCountInATable(databaseFile, rightChildPageNumber, pageSize, tableName)
+	}
+
+	return 0
+}
+
+func countRecordsInBTree(databaseFile *os.File, pageNumber int32, pageSize int32) int {
 	numTables := 0
 	const headerSize int32 = 100
-	pageOffset := (pageNumber-1)*pageSize + headerSize
+	var pageOffset int32 = (pageNumber - 1) * pageSize
+	if pageNumber == 1 {
+		pageOffset += headerSize
+	}
 
 	data, err := readBytesAtOffset(databaseFile, int64(pageOffset), 1)
 	if err != nil {
@@ -220,43 +376,27 @@ func getNumTablesInBTree(databaseFile *os.File, pageNumber int32, pageSize int32
 
 	switch data[0] {
 	case 0x0D: // Leaf page
-		data, err = readBytesAtOffset(databaseFile, int64(pageOffset+3), 2)
-		if err != nil {
-			return 0
-		}
-		cellCount := binary.BigEndian.Uint16(data)
+		cellCount := getCellCount(databaseFile, pageOffset)
 		numTables += int(cellCount)
 
 	case 0x05: // Interior page
-		data, err = readBytesAtOffset(databaseFile, int64(pageOffset+3), 2)
-		if err != nil {
-			return 0
-		}
-		cellCount := binary.BigEndian.Uint16(data)
+		cellCount := getCellCount(databaseFile, pageOffset)
 
 		for i := int32(0); i < int32(cellCount); i++ {
 			cellPointerOffset := pageOffset + 12 + (i * 2)
-			data, err = readBytesAtOffset(databaseFile, int64(cellPointerOffset), 2)
-			if err != nil {
-				continue
-			}
-			cellContentOffset := pageOffset + int32(binary.BigEndian.Uint16(data))
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset)
 
 			data, err = readBytesAtOffset(databaseFile, int64(cellContentOffset), 4)
 			if err != nil {
 				continue
 			}
 			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
-			numTables += getNumTablesInBTree(databaseFile, leftChildPageNumber, pageSize)
+			numTables += countRecordsInBTree(databaseFile, leftChildPageNumber, pageSize)
 		}
 
 		// Rightmost pointer
-		data, err = readBytesAtOffset(databaseFile, int64(pageOffset+8), 4)
-		if err != nil {
-			return numTables
-		}
-		rightChildPageNumber := int32(binary.BigEndian.Uint32(data))
-		numTables += getNumTablesInBTree(databaseFile, rightChildPageNumber, pageSize)
+		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
+		numTables += countRecordsInBTree(databaseFile, rightChildPageNumber, pageSize)
 	}
 
 	return numTables
@@ -290,7 +430,7 @@ func main() {
 		}
 
 		// Task 1: Getting number of tables
-		var numTables int = getNumTablesInBTree(databaseFile, 1, int32(pageSize))
+		var numTables int = countRecordsInBTree(databaseFile, 1, int32(pageSize)) // Page 1 or root page stores the tables in the BTree
 
 		fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
 
@@ -327,7 +467,29 @@ func main() {
 		}
 
 	default:
-		fmt.Println("Unknown command", command)
+		databaseFile, err := os.Open(databaseFilePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer databaseFile.Close() // Ensure file is closed
+
+		header := make([]byte, 100)
+
+		_, err = databaseFile.Read(header)
+		if err != nil {
+			log.Fatal(err)
+		}
+		var pageSize int16 // since reading two bytes
+		if err := binary.Read(bytes.NewReader(header[16:18]), binary.BigEndian, &pageSize); err != nil {
+			fmt.Println("Failed to read integer:", err)
+			return
+		}
+
+		// Task 3: Process Count Command
+		words := strings.Fields(command)
+		tableName := words[len(words)-1]
+		numRows := getCountInATable(databaseFile, 1, int32(pageSize), tableName)
+		fmt.Printf("%d\n", numRows)
 		os.Exit(1)
 	}
 }
