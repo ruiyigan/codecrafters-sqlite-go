@@ -423,7 +423,7 @@ func main() {
 		}
 
 		// Task 1: Getting page size
-		var pageSize int16 // since reading two bytes
+		var pageSize uint16 // since reading two bytes
 		if err := binary.Read(bytes.NewReader(header[16:18]), binary.BigEndian, &pageSize); err != nil {
 			fmt.Println("Failed to read integer:", err)
 			return
@@ -450,7 +450,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		var pageSize int16 // since reading two bytes
+		var pageSize uint16 // since reading two bytes
 		if err := binary.Read(bytes.NewReader(header[16:18]), binary.BigEndian, &pageSize); err != nil {
 			fmt.Println("Failed to read integer:", err)
 			return
@@ -479,7 +479,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		var pageSize int16 // since reading two bytes
+		var pageSize uint16 // since reading two bytes
 		if err := binary.Read(bytes.NewReader(header[16:18]), binary.BigEndian, &pageSize); err != nil {
 			fmt.Println("Failed to read integer:", err)
 			return
