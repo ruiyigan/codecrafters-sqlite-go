@@ -199,13 +199,11 @@ func processLeafCellRecord(databaseFile *os.File, cellContentOffset int32) ([]by
 	headerSize, bytesReadHeader := readVarint(data, 0)
 	headerOffset := bytesReadHeader
 	bodyOffset := int64(headerSize) // Body starts after the header
-	bytesLeft := int32(headerSize) - bytesReadHeader
-
 	// Parse serial types
 	var serialTypes []int64
-	for int32(headerOffset) < bytesLeft {
+	for int32(headerOffset) < int32(headerSize) {
 		serialType, bytesRead := readVarint(data, int(headerOffset))
-		headerOffset += bytesRead
+		headerOffset += bytesRead // TODO: This may potentially make headerOffset + bytesRead > headerSize for last iteration. By right after everything headerOffset == headerSize
 		serialTypes = append(serialTypes, serialType)
 	}
 
@@ -290,6 +288,7 @@ func getTablesNamesInBTree(databaseFile *os.File, pageNumber int32, pageSize int
 }
 
 func getCountInATable(databaseFile *os.File, pageNumber int32, pageSize int32, tableName string) int {
+	var count int = 0
 	const headerSize int32 = 100
 	var pageOffset int32 = (pageNumber - 1) * pageSize
 	if pageNumber == 1 {
@@ -298,7 +297,7 @@ func getCountInATable(databaseFile *os.File, pageNumber int32, pageSize int32, t
 
 	data, err := readBytesAtOffset(databaseFile, int64(pageOffset), 1)
 	if err != nil {
-		return 0
+		return count
 	}
 
 	switch data[0] {
@@ -359,19 +358,20 @@ func getCountInATable(databaseFile *os.File, pageNumber int32, pageSize int32, t
 				continue
 			}
 			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
-			return getCountInATable(databaseFile, leftChildPageNumber, pageSize, tableName)
+			count = count + getCountInATable(databaseFile, leftChildPageNumber, pageSize, tableName)
 
 		}
 
 		// Rightmost pointer
 		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
-		return getCountInATable(databaseFile, rightChildPageNumber, pageSize, tableName)
+		count = count + getCountInATable(databaseFile, rightChildPageNumber, pageSize, tableName)
+		return count
 	}
 
 	return 0
 }
 
-func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32, colIdx int) []string {
+func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32, colIdx []int) []string {
 	var columnData []string
 	const headerSize int32 = 100
 	var pageOffset int32 = (pageNumber - 1) * pageSize
@@ -397,19 +397,25 @@ func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32
 			}
 
 			data, serialTypes, bodyOffset := processLeafCellRecord(databaseFile, cellContentOffset)
-			for idx, serialType := range serialTypes {
+			var rowValues []string
+			var dataForCol string = ""
+			for _, serialType := range serialTypes {
 				size := getSerialTypeSize(serialType)
 				value := data[bodyOffset : bodyOffset+int64(size)]
-
 				strValue := processSerialType(serialType, value)
-
-				if colIdx == idx {
-					columnData = append(columnData, strValue)
-				}
-
+				rowValues = append(rowValues, strValue)
 				bodyOffset += int64(size)
 			}
+			for i, idx := range colIdx {
+				if idx > 0 && idx <= len(rowValues) { // Check valid table indices excluding id
+					if i > 0 {
+						dataForCol += "|"
+					}
+					dataForCol += rowValues[idx]
+				}
+			}
 
+			columnData = append(columnData, dataForCol)
 		}
 
 		return columnData
@@ -428,19 +434,21 @@ func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32
 				continue
 			}
 			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
-			return getColumnDataHelper(databaseFile, leftChildPageNumber, pageSize, colIdx)
-
+			tempData := getColumnDataHelper(databaseFile, leftChildPageNumber, pageSize, colIdx)
+			columnData = append(columnData, tempData...)
 		}
 
 		// Rightmost pointer
 		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
-		return getColumnDataHelper(databaseFile, rightChildPageNumber, pageSize, colIdx)
+		tempData := getColumnDataHelper(databaseFile, rightChildPageNumber, pageSize, colIdx)
+		columnData = append(columnData, tempData...)
+		return columnData
 	}
 
 	return columnData
 }
 
-func readDataFromSingleColumn(databaseFile *os.File, pageNumber int32, pageSize int32, tableName string, columnName string) []string {
+func readDataFromMultipleColumns(databaseFile *os.File, pageNumber int32, pageSize int32, tableName string, colNames []string) []string {
 	var columnData []string
 	const headerSize int32 = 100
 	var pageOffset int32 = (pageNumber - 1) * pageSize
@@ -459,7 +467,6 @@ func readDataFromSingleColumn(databaseFile *os.File, pageNumber int32, pageSize 
 
 		// loop through cell count
 		rootPage := 0
-		colIndex := 0
 		createStatement := ""
 		for i := int32(0); i < int32(cellCount); i++ {
 			cellPointerOffset := pageOffset + 8 + (i * 2)
@@ -469,33 +476,18 @@ func readDataFromSingleColumn(databaseFile *os.File, pageNumber int32, pageSize 
 			}
 
 			data, serialTypes, bodyOffset := processLeafCellRecord(databaseFile, cellContentOffset)
-
-			var foundTable bool = false
-			for colIdx, serialType := range serialTypes {
+			var recordValues []string
+			for _, serialType := range serialTypes {
 				size := getSerialTypeSize(serialType)
 				value := data[bodyOffset : bodyOffset+int64(size)]
-
 				strValue := processSerialType(serialType, value)
-
-				if colIdx == 2 { // tbl_name column
-					if serialType >= 13 && serialType%2 == 1 {
-						if strValue == tableName {
-							foundTable = true
-						}
-					}
-				}
-				if foundTable && colIdx == 3 {
-					// get root page
-					num, _ := strconv.Atoi(strValue)
-					rootPage = num
-				}
-				if foundTable && colIdx == 4 {
-					createStatement = strValue
-				}
-
+				recordValues = append(recordValues, strValue)
 				bodyOffset += int64(size)
 			}
-			if foundTable {
+			if len(recordValues) >= 5 && recordValues[0] == "table" && recordValues[2] == tableName {
+				num, _ := strconv.Atoi(recordValues[3])
+				rootPage = num
+				createStatement = recordValues[4]
 				break
 			}
 		}
@@ -504,18 +496,20 @@ func readDataFromSingleColumn(databaseFile *os.File, pageNumber int32, pageSize 
 		closeParenIndex := strings.LastIndex(createStatement, ")")
 		columnsPart := createStatement[openParenIndex+1 : closeParenIndex]
 		columnDefs := strings.Split(columnsPart, ",")
-
-		for idx, colDef := range columnDefs {
-			// Trim whitespace and split into words (name and type)
-			colDef = strings.TrimSpace(colDef)
-			words := strings.Fields(colDef)
-			if len(words) > 0 && words[0] == columnName {
-				colIndex = idx
+		var colIdxs []int
+		for _, colName := range colNames {
+			for idx, colDef := range columnDefs {
+				colDef = strings.TrimSpace(colDef)
+				words := strings.Fields(colDef)
+				if len(words) > 0 && words[0] == colName {
+					colIdxs = append(colIdxs, idx)
+					break
+				}
 			}
 		}
 
 		// With the columnName order and rootpage, we can use them to find the column data
-		columnData = getColumnDataHelper(databaseFile, int32(rootPage), pageSize, colIndex)
+		columnData = getColumnDataHelper(databaseFile, int32(rootPage), pageSize, colIdxs)
 
 		return columnData
 
@@ -534,13 +528,15 @@ func readDataFromSingleColumn(databaseFile *os.File, pageNumber int32, pageSize 
 				continue
 			}
 			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
-			return readDataFromSingleColumn(databaseFile, leftChildPageNumber, pageSize, tableName, columnName)
-
+			tempData := readDataFromMultipleColumns(databaseFile, leftChildPageNumber, pageSize, tableName, colNames)
+			columnData = append(columnData, tempData...)
 		}
 
 		// Rightmost pointer
 		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
-		return readDataFromSingleColumn(databaseFile, rightChildPageNumber, pageSize, tableName, columnName)
+		tempData := readDataFromMultipleColumns(databaseFile, rightChildPageNumber, pageSize, tableName, colNames)
+		columnData = append(columnData, tempData...)
+		return columnData
 	}
 
 	return columnData
@@ -685,8 +681,8 @@ func main() {
 			} else {
 				// Task 4: Get column data
 				// Task 5: Allow multiple columns
+
 				// Find word from to find out how many columns
-				// column names
 				var colNames []string
 				var endCol int = 0
 				for i, word := range words {
@@ -702,19 +698,9 @@ func main() {
 						colNames = append(colNames, words[i])
 					}
 				}
-				var columnsData []string
-				for _, colName := range colNames {
-					columnData := readDataFromSingleColumn(databaseFile, 1, int32(pageSize), tableName, colName)
-					if len(columnsData) == 0 {
-						columnsData = columnData
-					} else {
-						for i := 0; i < len(columnsData); i++ {
-							newData := columnsData[i] + "|" + columnData[i]
-							columnsData[i] = newData
-						}
-					}
-				}
-				for _, data := range columnsData {
+
+				columnData := readDataFromMultipleColumns(databaseFile, 1, int32(pageSize), tableName, colNames)
+				for _, data := range columnData {
 					fmt.Println(data)
 				}
 			}
