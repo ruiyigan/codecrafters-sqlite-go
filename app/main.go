@@ -684,10 +684,37 @@ func main() {
 				fmt.Printf("%d\n", numRows)
 			} else {
 				// Task 4: Get column data
-				// Get column data
-				columnName := words[1]
-				columnData := readDataFromSingleColumn(databaseFile, 1, int32(pageSize), tableName, columnName)
-				for _, data := range columnData {
+				// Task 5: Allow multiple columns
+				// Find word from to find out how many columns
+				// column names
+				var colNames []string
+				var endCol int = 0
+				for i, word := range words {
+					if strings.ToLower(word) == "from" {
+						endCol = i
+					}
+				}
+
+				for i := 1; i < endCol; i++ {
+					if i != endCol-1 {
+						colNames = append(colNames, strings.TrimRight(words[i], ","))
+					} else {
+						colNames = append(colNames, words[i])
+					}
+				}
+				var columnsData []string
+				for _, colName := range colNames {
+					columnData := readDataFromSingleColumn(databaseFile, 1, int32(pageSize), tableName, colName)
+					if len(columnsData) == 0 {
+						columnsData = columnData
+					} else {
+						for i := 0; i < len(columnsData); i++ {
+							newData := columnsData[i] + "|" + columnData[i]
+							columnsData[i] = newData
+						}
+					}
+				}
+				for _, data := range columnsData {
 					fmt.Println(data)
 				}
 			}
