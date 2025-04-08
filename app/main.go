@@ -179,25 +179,25 @@ func getCellContentOffset(databaseFile *os.File, cellPointerOffset int32) int32 
 	return int32(binary.BigEndian.Uint16(data)) // offset in the cell array is relative to 0
 }
 
-func processLeafCellRecord(databaseFile *os.File, cellContentOffset int32) ([]byte, []int64, int64) {
+func processLeafCellRecord(databaseFile *os.File, cellContentOffset int32) ([]byte, []int64, int64, int64) {
 	// [varint] read size of the record
 	data, err := readBytesAtOffset(databaseFile, int64(cellContentOffset), 9)
 	if err != nil {
-		return nil, nil, 0
+		return nil, nil, 0, 0
 	}
 	recordSize, bytesReadRecordSize := readVarint(data, 0)
 	// [varint] read size of rowid
 	data, err = readBytesAtOffset(databaseFile, int64(cellContentOffset+bytesReadRecordSize), 9)
 	if err != nil {
-		return nil, nil, 0
+		return nil, nil, 0, 0
 	}
-	_, bytesReadRowId := readVarint(data, 0)
+	rowId, bytesReadRowId := readVarint(data, 0)
 
 	// Read the record data (with header)
 	recordOffset := cellContentOffset + bytesReadRecordSize + bytesReadRowId
 	data, err = readBytesAtOffset(databaseFile, int64(recordOffset), int(recordSize))
 	if err != nil {
-		return nil, nil, 0
+		return nil, nil, 0, 0
 	}
 
 	// [varint] Parse record header
@@ -212,7 +212,7 @@ func processLeafCellRecord(databaseFile *os.File, cellContentOffset int32) ([]by
 		serialTypes = append(serialTypes, serialType)
 	}
 
-	return data, serialTypes, bodyOffset
+	return data, serialTypes, bodyOffset, rowId
 }
 
 // PROCESS
@@ -242,7 +242,7 @@ func getTablesNamesInBTree(databaseFile *os.File, pageNumber int32, pageSize int
 				cellContentOffset += pageOffset
 			}
 
-			data, serialTypes, bodyOffset := processLeafCellRecord(databaseFile, cellContentOffset)
+			data, serialTypes, bodyOffset, _ := processLeafCellRecord(databaseFile, cellContentOffset)
 
 			for colIdx, serialType := range serialTypes {
 				size := getSerialTypeSize(serialType)
@@ -319,7 +319,7 @@ func getCountInATable(databaseFile *os.File, pageNumber int32, pageSize int32, t
 				cellContentOffset += pageOffset
 			}
 
-			data, serialTypes, bodyOffset := processLeafCellRecord(databaseFile, cellContentOffset)
+			data, serialTypes, bodyOffset, _ := processLeafCellRecord(databaseFile, cellContentOffset)
 
 			for colIdx, serialType := range serialTypes {
 				size := getSerialTypeSize(serialType)
@@ -400,7 +400,7 @@ func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32
 				cellContentOffset += pageOffset
 			}
 
-			data, serialTypes, bodyOffset := processLeafCellRecord(databaseFile, cellContentOffset)
+			data, serialTypes, bodyOffset, rowId := processLeafCellRecord(databaseFile, cellContentOffset)
 			var rowValues []string
 			var dataForCol string = ""
 			var isWhereConditionMet = true
@@ -416,9 +416,10 @@ func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32
 					break
 				}
 			}
+			rowValues[0] = strconv.FormatInt(rowId, 10)
 			if isWhereConditionMet {
 				for i, idx := range colIdx {
-					if idx > 0 && idx <= len(rowValues) { // Check valid table indices excluding id
+					if idx >= 0 && idx <= len(rowValues) { // Check valid table indices excluding id
 						if i > 0 {
 							dataForCol += "|"
 						}
@@ -489,7 +490,7 @@ func readDataFromMultipleColumns(databaseFile *os.File, pageNumber int32, pageSi
 				cellContentOffset += pageOffset
 			}
 
-			data, serialTypes, bodyOffset := processLeafCellRecord(databaseFile, cellContentOffset)
+			data, serialTypes, bodyOffset, _ := processLeafCellRecord(databaseFile, cellContentOffset)
 			var recordValues []string
 			for _, serialType := range serialTypes {
 				size := getSerialTypeSize(serialType)
@@ -508,7 +509,7 @@ func readDataFromMultipleColumns(databaseFile *os.File, pageNumber int32, pageSi
 		// Unpack where conditions
 		whereCol, whereValue := "", ""
 		if len(rawWhereConditions) != 0 {
-			whereCol, whereValue = rawWhereConditions[0], strings.Trim(rawWhereConditions[2], "'")
+			whereCol, whereValue = rawWhereConditions[0], strings.Trim(strings.Join(rawWhereConditions[2:], " "), "'")
 		}
 		var whereCondition WhereCondition = WhereCondition{ColIdx: -1, Value: ""}
 
