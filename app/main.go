@@ -12,6 +12,11 @@ import (
 	// Available if you need it!
 )
 
+type WhereCondition struct {
+	ColIdx int
+	Value  string
+}
+
 // HELPERS
 func readBytesAtOffset(file *os.File, offset int64, numBytes int) ([]byte, error) {
 	_, err := file.Seek(offset, 0)
@@ -371,7 +376,7 @@ func getCountInATable(databaseFile *os.File, pageNumber int32, pageSize int32, t
 	return 0
 }
 
-func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32, colIdx []int) []string {
+func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32, colIdx []int, whereCondition WhereCondition) []string {
 	var columnData []string
 	const headerSize int32 = 100
 	var pageOffset int32 = (pageNumber - 1) * pageSize
@@ -387,7 +392,6 @@ func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32
 	switch data[0] {
 	case 0x0D: // Leaf page
 		cellCount := getCellCount(databaseFile, pageOffset)
-
 		// loop through cell count
 		for i := int32(0); i < int32(cellCount); i++ {
 			cellPointerOffset := pageOffset + 8 + (i * 2)
@@ -399,23 +403,33 @@ func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32
 			data, serialTypes, bodyOffset := processLeafCellRecord(databaseFile, cellContentOffset)
 			var rowValues []string
 			var dataForCol string = ""
-			for _, serialType := range serialTypes {
+			var isWhereConditionMet = true
+			for i, serialType := range serialTypes {
 				size := getSerialTypeSize(serialType)
 				value := data[bodyOffset : bodyOffset+int64(size)]
 				strValue := processSerialType(serialType, value)
 				rowValues = append(rowValues, strValue)
 				bodyOffset += int64(size)
-			}
-			for i, idx := range colIdx {
-				if idx > 0 && idx <= len(rowValues) { // Check valid table indices excluding id
-					if i > 0 {
-						dataForCol += "|"
-					}
-					dataForCol += rowValues[idx]
+				if whereCondition.ColIdx != -1 && i == whereCondition.ColIdx && strValue != whereCondition.Value { // -1 is a marker for no where condition
+					// If the row condition does not meet the where condition, break
+					isWhereConditionMet = false
+					break
 				}
 			}
+			if isWhereConditionMet {
+				for i, idx := range colIdx {
+					if idx > 0 && idx <= len(rowValues) { // Check valid table indices excluding id
+						if i > 0 {
+							dataForCol += "|"
+						}
+						dataForCol += rowValues[idx]
+					}
+				}
 
-			columnData = append(columnData, dataForCol)
+				if dataForCol != "" {
+					columnData = append(columnData, dataForCol)
+				}
+			}
 		}
 
 		return columnData
@@ -434,13 +448,13 @@ func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32
 				continue
 			}
 			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
-			tempData := getColumnDataHelper(databaseFile, leftChildPageNumber, pageSize, colIdx)
+			tempData := getColumnDataHelper(databaseFile, leftChildPageNumber, pageSize, colIdx, whereCondition)
 			columnData = append(columnData, tempData...)
 		}
 
 		// Rightmost pointer
 		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
-		tempData := getColumnDataHelper(databaseFile, rightChildPageNumber, pageSize, colIdx)
+		tempData := getColumnDataHelper(databaseFile, rightChildPageNumber, pageSize, colIdx, whereCondition)
 		columnData = append(columnData, tempData...)
 		return columnData
 	}
@@ -448,7 +462,7 @@ func getColumnDataHelper(databaseFile *os.File, pageNumber int32, pageSize int32
 	return columnData
 }
 
-func readDataFromMultipleColumns(databaseFile *os.File, pageNumber int32, pageSize int32, tableName string, colNames []string) []string {
+func readDataFromMultipleColumns(databaseFile *os.File, pageNumber int32, pageSize int32, tableName string, colNames []string, rawWhereConditions []string) []string {
 	var columnData []string
 	const headerSize int32 = 100
 	var pageOffset int32 = (pageNumber - 1) * pageSize
@@ -491,6 +505,13 @@ func readDataFromMultipleColumns(databaseFile *os.File, pageNumber int32, pageSi
 				break
 			}
 		}
+		// Unpack where conditions
+		whereCol, whereValue := "", ""
+		if len(rawWhereConditions) != 0 {
+			whereCol, whereValue = rawWhereConditions[0], strings.Trim(rawWhereConditions[2], "'")
+		}
+		var whereCondition WhereCondition = WhereCondition{ColIdx: -1, Value: ""}
+
 		// Get order of columnName in table
 		openParenIndex := strings.Index(createStatement, "(")
 		closeParenIndex := strings.LastIndex(createStatement, ")")
@@ -507,9 +528,17 @@ func readDataFromMultipleColumns(databaseFile *os.File, pageNumber int32, pageSi
 				}
 			}
 		}
+		for idx, colDef := range columnDefs {
+			colDef = strings.TrimSpace(colDef)
+			words := strings.Fields(colDef)
+			if words[0] == whereCol {
+				whereCondition = WhereCondition{ColIdx: idx, Value: whereValue}
+				break
+			}
+		}
 
 		// With the columnName order and rootpage, we can use them to find the column data
-		columnData = getColumnDataHelper(databaseFile, int32(rootPage), pageSize, colIdxs)
+		columnData = getColumnDataHelper(databaseFile, int32(rootPage), pageSize, colIdxs, whereCondition)
 
 		return columnData
 
@@ -528,13 +557,13 @@ func readDataFromMultipleColumns(databaseFile *os.File, pageNumber int32, pageSi
 				continue
 			}
 			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
-			tempData := readDataFromMultipleColumns(databaseFile, leftChildPageNumber, pageSize, tableName, colNames)
+			tempData := readDataFromMultipleColumns(databaseFile, leftChildPageNumber, pageSize, tableName, colNames, rawWhereConditions)
 			columnData = append(columnData, tempData...)
 		}
 
 		// Rightmost pointer
 		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
-		tempData := readDataFromMultipleColumns(databaseFile, rightChildPageNumber, pageSize, tableName, colNames)
+		tempData := readDataFromMultipleColumns(databaseFile, rightChildPageNumber, pageSize, tableName, colNames, rawWhereConditions)
 		columnData = append(columnData, tempData...)
 		return columnData
 	}
@@ -671,7 +700,17 @@ func main() {
 		}
 
 		words := strings.Fields(command)
-		tableName := words[len(words)-1]
+		var fromWordIndex int = 0
+		var whereWordIndex int = -1
+		for i, word := range words {
+			if strings.ToLower(word) == "from" {
+				fromWordIndex = i
+			}
+			if strings.ToLower(word) == "where" {
+				whereWordIndex = i
+			}
+		}
+		tableName := words[fromWordIndex+1]
 		if strings.ToLower(words[0]) == "select" {
 			// Task 3: Process Count Command
 			if strings.ToLower(words[1]) == "count(*)" {
@@ -680,26 +719,26 @@ func main() {
 				fmt.Printf("%d\n", numRows)
 			} else {
 				// Task 4: Get column data
-				// Task 5: Allow multiple columns
 
 				// Find word from to find out how many columns
 				var colNames []string
-				var endCol int = 0
-				for i, word := range words {
-					if strings.ToLower(word) == "from" {
-						endCol = i
-					}
-				}
 
-				for i := 1; i < endCol; i++ {
-					if i != endCol-1 {
+				// Task 5: Allow multiple columns
+				for i := 1; i < fromWordIndex; i++ {
+					if i != fromWordIndex-1 {
 						colNames = append(colNames, strings.TrimRight(words[i], ","))
 					} else {
 						colNames = append(colNames, words[i])
 					}
 				}
 
-				columnData := readDataFromMultipleColumns(databaseFile, 1, int32(pageSize), tableName, colNames)
+				// Task 6: Support Where Clause
+				var whereConditions []string
+				if whereWordIndex != -1 {
+					whereConditions = words[whereWordIndex+1:]
+				}
+
+				columnData := readDataFromMultipleColumns(databaseFile, 1, int32(pageSize), tableName, colNames, whereConditions)
 				for _, data := range columnData {
 					fmt.Println(data)
 				}
