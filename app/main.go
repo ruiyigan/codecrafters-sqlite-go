@@ -109,13 +109,25 @@ func processSerialType(serialType int64, value []byte) string {
 		num := int16(binary.BigEndian.Uint16(value))
 		strValue = fmt.Sprintf("%d", num)
 	case 3: // 24-bit twos-complement integer (big-endian)
-		num := int32(binary.BigEndian.Uint32(append([]byte{0}, value[:3]...))) >> 8 // Pad to 32-bit and shift
+		var extendedBytes []byte
+		if value[0]&0x80 != 0 { // Check if the sign bit is set
+			extendedBytes = append([]byte{0xFF}, value[:3]...)
+		} else {
+			extendedBytes = append([]byte{0x00}, value[:3]...)
+		}
+		num := int32(binary.BigEndian.Uint32(extendedBytes))
 		strValue = fmt.Sprintf("%d", num)
 	case 4: // 32-bit twos-complement integer (big-endian)
 		num := int32(binary.BigEndian.Uint32(value))
 		strValue = fmt.Sprintf("%d", num)
 	case 5: // 48-bit twos-complement integer (big-endian)
-		num := int64(binary.BigEndian.Uint64(append([]byte{0, 0}, value[:6]...))) >> 16 // Pad to 64-bit and shift
+		var extendedBytes []byte
+		if value[0]&0x80 != 0 {
+			extendedBytes = append([]byte{0xFF, 0xFF}, value[:6]...)
+		} else {
+			extendedBytes = append([]byte{0x00, 0x00}, value[:6]...)
+		}
+		num := int64(binary.BigEndian.Uint64(extendedBytes))
 		strValue = fmt.Sprintf("%d", num)
 	case 6: // 64-bit twos-complement integer (big-endian)
 		num := int64(binary.BigEndian.Uint64(value))
@@ -213,6 +225,35 @@ func processLeafCellRecord(databaseFile *os.File, cellContentOffset int32) ([]by
 	}
 
 	return data, serialTypes, bodyOffset, rowId
+}
+
+func processIndexRecord(databaseFile *os.File, cellContentOffset int32) ([]byte, []int64, int64) {
+	// [varint] read size of the record
+	data, err := readBytesAtOffset(databaseFile, int64(cellContentOffset), 9)
+	if err != nil {
+		return nil, nil, 0
+	}
+	recordSize, bytesReadRecordSize := readVarint(data, 0)
+	// Read the record data (with header)
+	recordOffset := cellContentOffset + bytesReadRecordSize
+	data, err = readBytesAtOffset(databaseFile, int64(recordOffset), int(recordSize))
+	if err != nil {
+		return nil, nil, 0
+	}
+
+	// [varint] Parse record header
+	headerSize, bytesReadHeader := readVarint(data, 0)
+	headerOffset := bytesReadHeader
+	bodyOffset := int64(headerSize) // Body starts after the header
+	// Parse serial types
+	var serialTypes []int64
+	for int32(headerOffset) < int32(headerSize) {
+		serialType, bytesRead := readVarint(data, int(headerOffset))
+		headerOffset += bytesRead // TODO: This may potentially make headerOffset + bytesRead > headerSize for last iteration. By right after everything headerOffset == headerSize
+		serialTypes = append(serialTypes, serialType)
+	}
+
+	return data, serialTypes, bodyOffset
 }
 
 // PROCESS
@@ -616,6 +657,353 @@ func countRecordsInBTree(databaseFile *os.File, pageNumber int32, pageSize int32
 	return numTables
 }
 
+func getRowIdsFromIndexTreeHelper(databaseFile *os.File, pageNumber int32, pageSize int32, colValue string) []string {
+	var rowIds []string
+	const headerSize int32 = 100
+	var pageOffset int32 = (pageNumber - 1) * pageSize
+	if pageNumber == 1 {
+		pageOffset += headerSize
+	}
+
+	data, err := readBytesAtOffset(databaseFile, int64(pageOffset), 1)
+	if err != nil {
+		return rowIds
+	}
+
+	switch data[0] {
+	case 0x0a: // Leaf page
+		cellCount := getCellCount(databaseFile, pageOffset)
+		// loop through cell count
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 8 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset) // offset in the cell array is relative to the start of page
+			if pageNumber != 1 {                                                       // Only add if not first page since for the first page you don't want to offset 100 since its not start
+				cellContentOffset += pageOffset
+			}
+			data, serialTypes, bodyOffset := processIndexRecord(databaseFile, cellContentOffset) // Don't have rowid
+			var recordValues []string
+			for _, serialType := range serialTypes {
+				size := getSerialTypeSize(serialType)
+				value := data[bodyOffset : bodyOffset+int64(size)]
+				strValue := processSerialType(serialType, value)
+				recordValues = append(recordValues, strValue)
+				bodyOffset += int64(size)
+			}
+			if recordValues[0] == colValue {
+				rowIds = append(rowIds, recordValues[1])
+			}
+		}
+
+		return rowIds
+
+	case 0x02: // Interior page
+		cellCount := getCellCount(databaseFile, pageOffset)
+
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 12 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset) // offset in the cell array is relative to the start of page
+			if pageNumber != 1 {                                                       // Only add if not first page since for the first page you don't want to offset 100 since its not start
+				cellContentOffset += pageOffset
+			}
+			data, err = readBytesAtOffset(databaseFile, int64(cellContentOffset), 4)
+			if err != nil {
+				continue
+			}
+			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
+			// read varint with the total number of bytes for payload
+			data, serialTypes, bodyOffset := processIndexRecord(databaseFile, cellContentOffset+4)
+			var recordValues []string
+			for _, serialType := range serialTypes {
+				size := getSerialTypeSize(serialType)
+				value := data[bodyOffset : bodyOffset+int64(size)]
+				strValue := processSerialType(serialType, value)
+				recordValues = append(recordValues, strValue)
+				bodyOffset += int64(size)
+			}
+			if colValue < recordValues[0] {
+				tempData := getRowIdsFromIndexTreeHelper(databaseFile, leftChildPageNumber, pageSize, colValue)
+				rowIds = append(rowIds, tempData...)
+				return rowIds
+			} else if colValue == recordValues[0] {
+				tempData := getRowIdsFromIndexTreeHelper(databaseFile, leftChildPageNumber, pageSize, colValue)
+				rowIds = append(rowIds, tempData...)
+			}
+		}
+
+		// Rightmost pointer
+		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
+		tempData := getRowIdsFromIndexTreeHelper(databaseFile, rightChildPageNumber, pageSize, colValue)
+		rowIds = append(rowIds, tempData...)
+		return rowIds
+	}
+
+	return rowIds
+}
+
+func getRowIdsFromIndexTree(databaseFile *os.File, pageNumber int32, pageSize int32, tableName string, rawWhereConditions []string) []string {
+	var rowIds []string
+	const headerSize int32 = 100
+	var pageOffset int32 = (pageNumber - 1) * pageSize
+	if pageNumber == 1 {
+		pageOffset += headerSize
+	}
+
+	data, err := readBytesAtOffset(databaseFile, int64(pageOffset), 1)
+	if err != nil {
+		return rowIds
+	}
+
+	switch data[0] {
+	case 0x0D: // Leaf page
+		cellCount := getCellCount(databaseFile, pageOffset)
+
+		// loop through cell count
+		rootPage := 0
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 8 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset) // offset in the cell array is relative to the start of page
+			if pageNumber != 1 {                                                       // Only add if not first page since for the first page you don't want to offset 100 since its not
+				cellContentOffset += pageOffset
+			}
+
+			data, serialTypes, bodyOffset, _ := processLeafCellRecord(databaseFile, cellContentOffset)
+			var recordValues []string
+			for _, serialType := range serialTypes {
+				size := getSerialTypeSize(serialType)
+				value := data[bodyOffset : bodyOffset+int64(size)]
+				strValue := processSerialType(serialType, value)
+				recordValues = append(recordValues, strValue)
+				bodyOffset += int64(size)
+			}
+			// Change to get the index of the table name instead
+			if len(recordValues) >= 5 && recordValues[0] == "index" && recordValues[2] == tableName {
+				num, _ := strconv.Atoi(recordValues[3])
+				rootPage = num
+				break
+			}
+		}
+
+		// this helper function should take in the rootPage of the index tree.. and from there find the row ids
+		// another function that takes in row ids and colNames or something to return back data (will also need to find rootpage i think)
+		whereValue := strings.Trim(strings.Join(rawWhereConditions[2:], " "), "'")
+		rowIds = getRowIdsFromIndexTreeHelper(databaseFile, int32(rootPage), pageSize, whereValue)
+
+		return rowIds
+
+	case 0x05: // Interior page
+		cellCount := getCellCount(databaseFile, pageOffset)
+
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 12 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset) // offset in the cell array is relative to the start of page
+			if pageNumber != 1 {                                                       // Only add if not first page since for the first page you don't want to offset 100 since its not start
+				cellContentOffset += pageOffset
+			}
+
+			data, err = readBytesAtOffset(databaseFile, int64(cellContentOffset), 4)
+			if err != nil {
+				continue
+			}
+			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
+			tempData := getRowIdsFromIndexTree(databaseFile, leftChildPageNumber, pageSize, tableName, rawWhereConditions)
+			rowIds = append(rowIds, tempData...)
+		}
+
+		// Rightmost pointer
+		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
+		tempData := getRowIdsFromIndexTree(databaseFile, rightChildPageNumber, pageSize, tableName, rawWhereConditions)
+		rowIds = append(rowIds, tempData...)
+		return rowIds
+	}
+
+	return rowIds
+}
+
+func readDataByRowIdsHelper(databaseFile *os.File, pageNumber int32, pageSize int32, colIdx []int, rowIdTarget string) []string {
+	var columnData []string
+	const headerSize int32 = 100
+	var pageOffset int32 = (pageNumber - 1) * pageSize
+	if pageNumber == 1 {
+		pageOffset += headerSize
+	}
+
+	data, err := readBytesAtOffset(databaseFile, int64(pageOffset), 1)
+	if err != nil {
+		return columnData
+	}
+	rowIdIntTarget, _ := strconv.ParseInt(rowIdTarget, 10, 64)
+	switch data[0] {
+	case 0x0D: // Leaf page
+		cellCount := getCellCount(databaseFile, pageOffset)
+		// loop through cell count
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 8 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset) // offset in the cell array is relative to the start of page
+			if pageNumber != 1 {                                                       // Only add if not first page since for the first page you don't want to offset 100 since its not start
+				cellContentOffset += pageOffset
+			}
+
+			data, serialTypes, bodyOffset, rowId := processLeafCellRecord(databaseFile, cellContentOffset)
+			var rowValues []string
+			var dataForCol string = ""
+			if rowId == rowIdIntTarget {
+				for _, serialType := range serialTypes {
+					size := getSerialTypeSize(serialType)
+					value := data[bodyOffset : bodyOffset+int64(size)]
+					strValue := processSerialType(serialType, value)
+					rowValues = append(rowValues, strValue)
+					bodyOffset += int64(size)
+				}
+				rowValues[0] = strconv.FormatInt(rowId, 10)
+				for i, idx := range colIdx {
+					if idx >= 0 && idx <= len(rowValues) { // Check valid table indices excluding id
+						if i > 0 {
+							dataForCol += "|"
+						}
+						dataForCol += rowValues[idx]
+					}
+				}
+				columnData = append(columnData, dataForCol)
+				return columnData // Return immediately since rowid is unique
+			}
+		}
+
+	case 0x05: // Interior page
+		cellCount := getCellCount(databaseFile, pageOffset)
+
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 12 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset) // offset in the cell array is relative to the start of page
+			if pageNumber != 1 {                                                       // Only add if not first page since for the first page you don't want to offset 100 since its not start
+				cellContentOffset += pageOffset
+			}
+			data, err = readBytesAtOffset(databaseFile, int64(cellContentOffset), 4)
+			if err != nil {
+				continue
+			}
+			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
+			data, err := readBytesAtOffset(databaseFile, int64(cellContentOffset+4), 9)
+			if err != nil {
+				continue
+			}
+			key, _ := readVarint(data, 0)
+			if int64(rowIdIntTarget) < key {
+				tempData := readDataByRowIdsHelper(databaseFile, leftChildPageNumber, pageSize, colIdx, rowIdTarget)
+				columnData = append(columnData, tempData...)
+				return columnData
+			} else if int64(rowIdIntTarget) == key {
+				tempData := readDataByRowIdsHelper(databaseFile, leftChildPageNumber, pageSize, colIdx, rowIdTarget)
+				columnData = append(columnData, tempData...)
+			}
+		}
+
+		// Rightmost pointer
+		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
+		tempData := readDataByRowIdsHelper(databaseFile, rightChildPageNumber, pageSize, colIdx, rowIdTarget)
+		columnData = append(columnData, tempData...)
+		return columnData
+	}
+
+	return columnData
+}
+
+func readDataByRowIds(databaseFile *os.File, pageNumber int32, pageSize int32, tableName string, colNames []string, rowIds []string) []string {
+	var columnData []string
+	const headerSize int32 = 100
+	var pageOffset int32 = (pageNumber - 1) * pageSize
+	if pageNumber == 1 {
+		pageOffset += headerSize
+	}
+
+	data, err := readBytesAtOffset(databaseFile, int64(pageOffset), 1)
+	if err != nil {
+		return columnData
+	}
+
+	switch data[0] {
+	case 0x0D: // Leaf page
+		cellCount := getCellCount(databaseFile, pageOffset)
+
+		// loop through cell count
+		rootPage := 0
+		createStatement := ""
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 8 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset) // offset in the cell array is relative to the start of page
+			if pageNumber != 1 {                                                       // Only add if not first page since for the first page you don't want to offset 100 since its not
+				cellContentOffset += pageOffset
+			}
+
+			data, serialTypes, bodyOffset, _ := processLeafCellRecord(databaseFile, cellContentOffset)
+			var recordValues []string
+			for _, serialType := range serialTypes {
+				size := getSerialTypeSize(serialType)
+				value := data[bodyOffset : bodyOffset+int64(size)]
+				strValue := processSerialType(serialType, value)
+				recordValues = append(recordValues, strValue)
+				bodyOffset += int64(size)
+			}
+			if len(recordValues) >= 5 && recordValues[0] == "table" && recordValues[2] == tableName {
+				num, _ := strconv.Atoi(recordValues[3])
+				rootPage = num
+				createStatement = recordValues[4]
+				break
+			}
+		}
+		// Get order of columnName in table
+		openParenIndex := strings.Index(createStatement, "(")
+		closeParenIndex := strings.LastIndex(createStatement, ")")
+		columnsPart := createStatement[openParenIndex+1 : closeParenIndex]
+		columnDefs := strings.Split(columnsPart, ",")
+		var colIdxs []int
+		for _, colName := range colNames {
+			for idx, colDef := range columnDefs {
+				colDef = strings.TrimSpace(colDef)
+				words := strings.Fields(colDef)
+				if len(words) > 0 && words[0] == colName {
+					colIdxs = append(colIdxs, idx)
+					break
+				}
+			}
+		}
+
+		// With the columnName order and rootpage, we can use them to find the column data
+		for _, rowId := range rowIds {
+			tempData := readDataByRowIdsHelper(databaseFile, int32(rootPage), pageSize, colIdxs, rowId)
+			columnData = append(columnData, tempData...)
+		}
+
+		return columnData
+
+	case 0x05: // Interior page
+		cellCount := getCellCount(databaseFile, pageOffset)
+
+		for i := int32(0); i < int32(cellCount); i++ {
+			cellPointerOffset := pageOffset + 12 + (i * 2)
+			cellContentOffset := getCellContentOffset(databaseFile, cellPointerOffset) // offset in the cell array is relative to the start of page
+			if pageNumber != 1 {                                                       // Only add if not first page since for the first page you don't want to offset 100 since its not start
+				cellContentOffset += pageOffset
+			}
+
+			data, err = readBytesAtOffset(databaseFile, int64(cellContentOffset), 4)
+			if err != nil {
+				continue
+			}
+			leftChildPageNumber := int32(binary.BigEndian.Uint32(data))
+			tempData := readDataFromMultipleColumns(databaseFile, leftChildPageNumber, pageSize, tableName, colNames, rowIds)
+			columnData = append(columnData, tempData...)
+		}
+
+		// Rightmost pointer
+		rightChildPageNumber := getRightmostChildPageNumber(databaseFile, pageOffset)
+		tempData := readDataFromMultipleColumns(databaseFile, rightChildPageNumber, pageSize, tableName, colNames, rowIds)
+		columnData = append(columnData, tempData...)
+		return columnData
+	}
+
+	return columnData
+}
+
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
 	databaseFilePath := os.Args[1]
@@ -739,10 +1127,24 @@ func main() {
 					whereConditions = words[whereWordIndex+1:]
 				}
 
-				columnData := readDataFromMultipleColumns(databaseFile, 1, int32(pageSize), tableName, colNames, whereConditions)
-				for _, data := range columnData {
-					fmt.Println(data)
+				// Task 7: Support index
+				// Grab where if country then search index
+				// TODO: Make this less hard coded 1) knowing its country that is indexed?
+				if len(whereConditions) != 0 && whereConditions[0] == "country" {
+					// Search Index tree to return array of rowids
+					// With this rowids, search the table tree
+					rowIds := getRowIdsFromIndexTree(databaseFile, 1, int32(pageSize), tableName, whereConditions) // TODO: maybe should split to find table root ppage,
+					columnData := readDataByRowIds(databaseFile, 1, int32(pageSize), tableName, colNames, rowIds)  // this function works
+					for _, data := range columnData {
+						fmt.Println(data)
+					}
+				} else {
+					columnData := readDataFromMultipleColumns(databaseFile, 1, int32(pageSize), tableName, colNames, whereConditions)
+					for _, data := range columnData {
+						fmt.Println(data)
+					}
 				}
+
 			}
 
 		}
