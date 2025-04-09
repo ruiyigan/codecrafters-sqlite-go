@@ -725,6 +725,7 @@ func getRowIdsFromIndexTreeHelper(databaseFile *os.File, pageNumber int32, pageS
 				rowIds = append(rowIds, tempData...)
 				return rowIds
 			} else if colValue == recordValues[0] {
+				rowIds = append(rowIds, recordValues[1]) // stores payload too, seems like not in leaf nodes
 				tempData := getRowIdsFromIndexTreeHelper(databaseFile, leftChildPageNumber, pageSize, colValue)
 				rowIds = append(rowIds, tempData...)
 			}
