@@ -1130,12 +1130,11 @@ func main() {
 
 				// Task 7: Support index
 				// Grab where if country then search index
-				// TODO: Make this less hard coded 1) knowing its country that is indexed?
 				if len(whereConditions) != 0 && whereConditions[0] == "country" {
 					// Search Index tree to return array of rowids
 					// With this rowids, search the table tree
-					rowIds := getRowIdsFromIndexTree(databaseFile, 1, int32(pageSize), tableName, whereConditions) // TODO: maybe should split to find table root ppage,
-					columnData := readDataByRowIds(databaseFile, 1, int32(pageSize), tableName, colNames, rowIds)  // this function works
+					rowIds := getRowIdsFromIndexTree(databaseFile, 1, int32(pageSize), tableName, whereConditions)
+					columnData := readDataByRowIds(databaseFile, 1, int32(pageSize), tableName, colNames, rowIds)
 					for _, data := range columnData {
 						fmt.Println(data)
 					}
